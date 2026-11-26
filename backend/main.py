@@ -4,9 +4,15 @@ import json
 import time
 import subprocess
 import ast
+import threading
 
 from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
+
+
+# ============================================================
+# FASTAPI APP
+# ============================================================
 
 app = FastAPI(
     title="EchoGuard Backend",
@@ -22,48 +28,219 @@ app.add_middleware(
     allow_headers=["*"]
 )
 
+
+# ============================================================
+# PATHS
+# ============================================================
+
 BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
 BASE_DIR = os.path.dirname(BACKEND_DIR)
+
 UPLOAD_DIR = os.path.join(BACKEND_DIR, "uploads")
 
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
+
+# ============================================================
+# M1 PATHS
+# ============================================================
+
 M1_PYTHON = os.path.join(
-    BASE_DIR, "m1", "m1_venv", "Scripts", "python.exe"
+    BASE_DIR,
+    "m1",
+    "m1_venv",
+    "Scripts",
+    "python.exe"
 )
 
 M1_SCRIPT = os.path.join(
-    BASE_DIR, "m1", "predict.py"
+    BASE_DIR,
+    "m1",
+    "predict.py"
 )
 
+
+# ============================================================
+# M2 PATHS
+# ============================================================
+
 M2_PYTHON = os.path.join(
-    BASE_DIR, "m2", "m2_venv", "Scripts", "python.exe"
+    BASE_DIR,
+    "m2",
+    "m2_venv",
+    "Scripts",
+    "python.exe"
 )
 
 M2_SCRIPT = os.path.join(
-    BASE_DIR, "m2", "transcribe_and_analyze.py"
+    BASE_DIR,
+    "m2",
+    "transcribe_and_analyze.py"
 )
 
 
+# ============================================================
+# PERSISTENT M2 WORKER
+# ============================================================
+
+m2_worker = None
+
+m2_lock = threading.Lock()
+
+
+def get_m2_worker():
+
+    global m2_worker
+
+    # Start a new worker if one does not exist
+    # or if the previous worker has stopped.
+
+    if m2_worker is None or m2_worker.poll() is not None:
+
+        print(
+            "Starting persistent M2 worker...",
+            flush=True
+        )
+
+        if not os.path.exists(M2_PYTHON):
+            raise FileNotFoundError(
+                f"M2 Python environment not found: {M2_PYTHON}"
+            )
+
+        if not os.path.exists(M2_SCRIPT):
+            raise FileNotFoundError(
+                f"M2 script not found: {M2_SCRIPT}"
+            )
+
+        m2_worker = subprocess.Popen(
+            [
+                M2_PYTHON,
+                M2_SCRIPT,
+                "--worker"
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=None,
+            text=True,
+            bufsize=1
+        )
+
+    return m2_worker
+
+
+def run_m2_worker(audio_path):
+
+    with m2_lock:
+
+        worker = get_m2_worker()
+
+        # Send audio path to the running M2 process.
+
+        worker.stdin.write(audio_path + "\n")
+        worker.stdin.flush()
+
+        # Read the JSON result.
+
+        output = worker.stdout.readline().strip()
+
+        if not output:
+
+            raise RuntimeError(
+                "M2 worker returned empty output or stopped unexpectedly."
+            )
+
+        result = json.loads(output)
+
+        if "error" in result:
+
+            raise RuntimeError(
+                result["error"]
+            )
+
+        return result
+
+
+def stop_m2_worker():
+
+    global m2_worker
+
+    if m2_worker is not None:
+
+        print(
+            "Stopping M2 worker...",
+            flush=True
+        )
+
+        try:
+
+            if m2_worker.poll() is None:
+
+                m2_worker.terminate()
+
+                try:
+                    m2_worker.wait(timeout=5)
+
+                except subprocess.TimeoutExpired:
+
+                    m2_worker.kill()
+                    m2_worker.wait()
+
+            if m2_worker.stdin:
+                m2_worker.stdin.close()
+
+            if m2_worker.stdout:
+                m2_worker.stdout.close()
+
+        except Exception as e:
+
+            print(
+                f"Error stopping M2 worker: {e}",
+                flush=True
+            )
+
+        m2_worker = None
+
+
+@app.on_event("shutdown")
+def shutdown_worker():
+
+    stop_m2_worker()
+
+
+# ============================================================
+# ROOT ENDPOINT
+# ============================================================
+
 @app.get("/")
 def root():
+
     return {
         "message": "EchoGuard Backend Running",
         "status": "active"
     }
 
 
+# ============================================================
+# HEALTH ENDPOINT
+# ============================================================
+
 @app.get("/health")
 def health():
+
     return {
         "status": "healthy"
     }
 
 
+# ============================================================
+# UPLOAD AUDIO
+# ============================================================
+
 @app.post("/upload-audio")
 async def upload_audio(file: UploadFile = File(...)):
 
     try:
+
         filename = os.path.basename(file.filename)
 
         file_path = os.path.join(
@@ -83,11 +260,16 @@ async def upload_audio(file: UploadFile = File(...)):
         }
 
     except Exception as e:
+
         return {
             "error": "Upload failed",
             "details": str(e)
         }
 
+
+# ============================================================
+# ANALYZE AUDIO
+# ============================================================
 
 @app.post("/analyze-audio")
 async def analyze_audio(file: UploadFile = File(...)):
@@ -96,9 +278,9 @@ async def analyze_audio(file: UploadFile = File(...)):
 
     try:
 
-        # --------------------------------------------------
+        # ----------------------------------------------------
         # SAVE AUDIO
-        # --------------------------------------------------
+        # ----------------------------------------------------
 
         filename = os.path.basename(file.filename)
 
@@ -118,45 +300,52 @@ async def analyze_audio(file: UploadFile = File(...)):
         )
 
 
-        # --------------------------------------------------
+        # ----------------------------------------------------
         # CHECK M1
-        # --------------------------------------------------
+        # ----------------------------------------------------
 
         if not os.path.exists(M1_PYTHON):
+
             return {
                 "error": "M1 Python environment not found",
                 "path": M1_PYTHON
             }
 
         if not os.path.exists(M1_SCRIPT):
+
             return {
                 "error": "M1 script not found",
                 "path": M1_SCRIPT
             }
 
 
-        # --------------------------------------------------
+        # ----------------------------------------------------
         # CHECK M2
-        # --------------------------------------------------
+        # ----------------------------------------------------
 
         if not os.path.exists(M2_PYTHON):
+
             return {
                 "error": "M2 Python environment not found",
                 "path": M2_PYTHON
             }
 
         if not os.path.exists(M2_SCRIPT):
+
             return {
                 "error": "M2 script not found",
                 "path": M2_SCRIPT
             }
 
 
-        # ==================================================
-        # M1
-        # ==================================================
+        # ====================================================
+        # M1 - VOICE AUTHENTICITY ANALYSIS
+        # ====================================================
 
-        print("Running M1...", flush=True)
+        print(
+            "Running M1...",
+            flush=True
+        )
 
         m1_start = time.time()
 
@@ -191,6 +380,7 @@ async def analyze_audio(file: UploadFile = File(...)):
 
 
         if m1_process.returncode != 0:
+
             return {
                 "error": "M1 analysis failed",
                 "details": m1_process.stderr,
@@ -198,9 +388,9 @@ async def analyze_audio(file: UploadFile = File(...)):
             }
 
 
-        # --------------------------------------------------
-        # PARSE M1
-        # --------------------------------------------------
+        # ----------------------------------------------------
+        # PARSE M1 RESULT
+        # ----------------------------------------------------
 
         m1_output = m1_process.stdout.strip()
 
@@ -217,12 +407,15 @@ async def analyze_audio(file: UploadFile = File(...)):
             ):
 
                 try:
+
                     m1_result = json.loads(line)
                     break
+
                 except json.JSONDecodeError:
                     pass
 
                 try:
+
                     m1_result = ast.literal_eval(line)
 
                     if isinstance(m1_result, dict):
@@ -233,6 +426,7 @@ async def analyze_audio(file: UploadFile = File(...)):
 
 
         if m1_result is None:
+
             return {
                 "error": "M1 returned invalid result",
                 "raw_output": m1_output,
@@ -249,6 +443,7 @@ async def analyze_audio(file: UploadFile = File(...)):
 
 
         if m1_score is None:
+
             return {
                 "error": "M1 returned no score",
                 "m1_result": m1_result
@@ -263,23 +458,33 @@ async def analyze_audio(file: UploadFile = File(...)):
         )
 
 
-        # ==================================================
-        # M2
-        # ==================================================
+        # ====================================================
+        # M2 - WHISPER + SCAM ANALYSIS
+        # ====================================================
 
-        print("Running M2...", flush=True)
+        print(
+            "Running M2...",
+            flush=True
+        )
 
         m2_start = time.time()
 
-        m2_process = subprocess.run(
-            [
-                M2_PYTHON,
-                M2_SCRIPT,
-                file_path
-            ],
-            text=True,
-            capture_output=True
-        )
+        try:
+
+            m2_result = run_m2_worker(file_path)
+
+        except Exception as e:
+
+            print(
+                f"M2 ERROR: {str(e)}",
+                flush=True
+            )
+
+            return {
+                "error": "M2 analysis failed",
+                "details": str(e)
+            }
+
 
         m2_time = time.time() - m2_start
 
@@ -289,70 +494,15 @@ async def analyze_audio(file: UploadFile = File(...)):
         )
 
         print(
-            "M2 stdout:",
-            repr(m2_process.stdout),
-            flush=True
-        )
-
-        print(
-            "M2 stderr:",
-            repr(m2_process.stderr),
+            "M2 result:",
+            json.dumps(m2_result),
             flush=True
         )
 
 
-        if m2_process.returncode != 0:
-            return {
-                "error": "M2 analysis failed",
-                "details": m2_process.stderr,
-                "raw_output": m2_process.stdout
-            }
-
-
-        # --------------------------------------------------
-        # PARSE M2
-        # --------------------------------------------------
-
-        m2_output = m2_process.stdout.strip()
-
-        m2_result = None
-
-        for line in reversed(m2_output.splitlines()):
-
-            line = line.strip()
-
-            if (
-                line.startswith("{")
-                and
-                line.endswith("}")
-            ):
-
-                try:
-                    m2_result = json.loads(line)
-                    break
-                except json.JSONDecodeError:
-                    pass
-
-
-        if m2_result is None:
-            return {
-                "error": "M2 returned invalid JSON",
-                "type": "JSONDecodeError",
-                "raw_output": m2_output,
-                "stderr": m2_process.stderr
-            }
-
-
-        if "error" in m2_result:
-            return {
-                "error": "M2 analysis failed",
-                "details": m2_result["error"]
-            }
-
-
-        # ==================================================
+        # ====================================================
         # NORMALIZE M2 SCORE
-        # ==================================================
+        # ====================================================
 
         m2_score = float(
             m2_result.get(
@@ -362,6 +512,7 @@ async def analyze_audio(file: UploadFile = File(...)):
         )
 
         if m2_score > 1:
+
             m2_score = m2_score / 10.0
 
         m2_score = min(
@@ -370,9 +521,9 @@ async def analyze_audio(file: UploadFile = File(...)):
         )
 
 
-        # ==================================================
-        # M3 RISK ENGINE
-        # ==================================================
+        # ====================================================
+        # M3 - COMBINED RISK ENGINE
+        # ====================================================
 
         final_score = (
             (m1_score * 0.40)
@@ -387,18 +538,21 @@ async def analyze_audio(file: UploadFile = File(...)):
 
 
         if final_score >= 0.70:
+
             risk_level = "HIGH"
 
         elif final_score >= 0.40:
+
             risk_level = "MEDIUM"
 
         else:
+
             risk_level = "LOW"
 
 
-        # ==================================================
+        # ====================================================
         # REASONS
-        # ==================================================
+        # ====================================================
 
         reasons = list(
             m2_result.get(
@@ -416,9 +570,9 @@ async def analyze_audio(file: UploadFile = File(...)):
             )
 
 
-        # ==================================================
+        # ====================================================
         # FINAL RESULT
-        # ==================================================
+        # ====================================================
 
         processing_time = (
             time.time()
@@ -427,6 +581,7 @@ async def analyze_audio(file: UploadFile = File(...)):
 
 
         result = {
+
             "message": "Audio analysis completed",
 
             "processing_time_seconds": round(
@@ -501,6 +656,10 @@ async def analyze_audio(file: UploadFile = File(...)):
         }
 
 
+# ============================================================
+# COMBINED RISK ENDPOINT
+# ============================================================
+
 @app.post("/analyze-combined")
 async def analyze_combined(data: dict):
 
@@ -527,6 +686,7 @@ async def analyze_combined(data: dict):
 
 
         if m2_score > 1:
+
             m2_score = m2_score / 10.0
 
 
@@ -549,12 +709,15 @@ async def analyze_combined(data: dict):
 
 
         if final_score >= 0.70:
+
             risk_level = "HIGH"
 
         elif final_score >= 0.40:
+
             risk_level = "MEDIUM"
 
         else:
+
             risk_level = "LOW"
 
 
@@ -575,6 +738,7 @@ async def analyze_combined(data: dict):
 
 
         return {
+
             "m1_voice_score": round(
                 m1_score,
                 4
@@ -606,7 +770,10 @@ async def analyze_combined(data: dict):
     except Exception as e:
 
         return {
+
             "error": "Risk analysis failed",
+
             "type": type(e).__name__,
+
             "details": str(e)
         }

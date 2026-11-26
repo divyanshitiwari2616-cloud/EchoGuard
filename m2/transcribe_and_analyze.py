@@ -1,9 +1,10 @@
+
 """
 EchoGuard - M2
-Audio -> Whisper Transcript -> Scam Analysis
+Persistent Whisper worker + scam analysis.
 
-stdout contains ONLY the final JSON result.
-Diagnostic messages are sent to stderr.
+stdout contains ONLY JSON results.
+Diagnostic messages go to stderr.
 """
 
 import sys
@@ -14,7 +15,7 @@ from scam_classifier import analyze_text
 _model = None
 
 
-def _get_model(model_size: str = "small"):
+def _get_model():
     global _model
 
     if _model is None:
@@ -27,9 +28,11 @@ def _get_model(model_size: str = "small"):
         )
 
         _model = WhisperModel(
-            model_size,
+            "base",
             device="cpu",
-            compute_type="int8"
+            compute_type="int8",
+            cpu_threads=4,
+            num_workers=1
         )
 
         print(
@@ -44,15 +47,10 @@ def _get_model(model_size: str = "small"):
 def transcribe(audio_path: str) -> tuple:
     model = _get_model()
 
-    hint = (
-        "OTP, PIN, CVV, KYC, RBI, bank account, "
-        "verification code, UPI"
-    )
-
     segments, info = model.transcribe(
         audio_path,
-        beam_size=5,
-        initial_prompt=hint
+        beam_size=1,
+        vad_filter=True
     )
 
     text = " ".join(
@@ -77,34 +75,52 @@ def analyze_audio(audio_path: str) -> dict:
     }
 
 
+def worker_mode():
+    """Keep one process alive and reuse the loaded model."""
+
+    print(
+        "M2 worker starting...",
+        file=sys.stderr,
+        flush=True
+    )
+
+    _get_model()
+
+    print(
+        "M2 worker ready.",
+        file=sys.stderr,
+        flush=True
+    )
+
+    for line in sys.stdin:
+        audio_path = line.strip()
+
+        if not audio_path:
+            continue
+
+        try:
+            result = analyze_audio(audio_path)
+
+        except Exception as e:
+            result = {"error": str(e)}
+
+        print(json.dumps(result), flush=True)
+
+
 if __name__ == "__main__":
 
-    if len(sys.argv) < 2:
-        print(
-            json.dumps({
-                "error": "No audio file provided"
-            }),
-            flush=True
-        )
+    if len(sys.argv) > 1 and sys.argv[1] == "--worker":
+        worker_mode()
+
+    elif len(sys.argv) < 2:
+        print(json.dumps({"error": "No audio file provided"}))
         sys.exit(1)
 
-    audio_path = sys.argv[1]
+    else:
+        try:
+            result = analyze_audio(sys.argv[1])
+            print(json.dumps(result), flush=True)
 
-    try:
-        result = analyze_audio(audio_path)
-
-        print(
-            json.dumps(result),
-            flush=True
-        )
-
-    except Exception as e:
-
-        print(
-            json.dumps({
-                "error": str(e)
-            }),
-            flush=True
-        )
-
-        sys.exit(1)
+        except Exception as e:
+            print(json.dumps({"error": str(e)}), flush=True)
+            sys.exit(1)

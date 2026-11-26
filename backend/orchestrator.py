@@ -65,9 +65,14 @@ def run_m1(audio_path):
 # Run M2
 # ============================================================
 
+
 def run_m2(audio_path):
 
+    import time
+
     print("\n[M2] Running Whisper + scam analysis...")
+
+    start = time.perf_counter()
 
     process = subprocess.run(
         [
@@ -79,52 +84,34 @@ def run_m2(audio_path):
         capture_output=True
     )
 
-    print(process.stdout)
+    elapsed = time.perf_counter() - start
+
+    print(f"[M2] Processing time: {elapsed:.2f} seconds")
 
     if process.returncode != 0:
         print("[M2 ERROR]")
         print(process.stderr)
         return None
 
-    output = process.stdout
+    try:
+        result = json.loads(process.stdout)
 
-    language = ""
-    transcript = ""
-    risk = "None"
-    score = 0
-    reasons = []
+        if "error" in result:
+            print("[M2 ERROR]", result["error"])
+            return None
 
-    for line in output.splitlines():
+        return {
+            "risk": result.get("risk", "Low"),
+            "score": result.get("score", 0),
+            "reasons": result.get("reasons", []),
+            "transcript": result.get("transcript", ""),
+            "language": result.get("language", "")
+        }
 
-        line = line.strip()
-
-        if line.startswith("Language detected"):
-            language = line.split(":", 1)[1].strip()
-
-        elif line.startswith("Transcript"):
-            transcript = line.split(":", 1)[1].strip()
-
-        elif line.startswith("Scam risk"):
-            risk_part = line.split(":", 1)[1].strip()
-
-            if "(score=" in risk_part:
-                risk = risk_part.split("(", 1)[0].strip()
-
-                score_text = risk_part.split("(score=", 1)[1]
-                score = int(score_text.rstrip(")"))
-
-        elif line.startswith("- "):
-            reasons.append(line[2:].strip())
-
-    return {
-        "risk": risk,
-        "score": score,
-        "reasons": reasons,
-        "transcript": transcript,
-        "language": language
-    }
-
-
+    except json.JSONDecodeError:
+        print("[M2 ERROR] Invalid JSON output")
+        print(process.stdout)
+        return None
 # ============================================================
 # Send M1 + M2 to M3
 # ============================================================
