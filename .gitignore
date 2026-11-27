@@ -9,3 +9,24 @@ __pycache__/
 backend/uploads/
 *.wav
 .streamlit/secrets.toml
+
+# React frontend
+echoguard-web/node_modules/
+echoguard-web/dist/
+echoguard-web/.vite/
+
+# Python model and cache files
+__pycache__/
+*.pyc
+
+# Backup files
+*.bak
+
+# React frontend
+echoguard-web/node_modules/
+echoguard-web/dist/
+
+# Backup files
+m1_backup/
+EchoGuard_Voice_Handover.zip
+backend/main_backup_before_lfcc.py

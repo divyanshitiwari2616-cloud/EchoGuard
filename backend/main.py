@@ -3,7 +3,6 @@ import os
 import json
 import time
 import subprocess
-import ast
 import threading
 
 from fastapi import FastAPI, UploadFile, File
@@ -56,7 +55,7 @@ M1_PYTHON = os.path.join(
 M1_SCRIPT = os.path.join(
     BASE_DIR,
     "m1",
-    "predict.py"
+    "predict_lfcc_segments.py"
 )
 
 
@@ -349,12 +348,13 @@ async def analyze_audio(file: UploadFile = File(...)):
 
         m1_start = time.time()
 
+        # Run the LFCC-based M1 predictor
         m1_process = subprocess.run(
             [
                 M1_PYTHON,
-                M1_SCRIPT
+                M1_SCRIPT,
+                file_path
             ],
-            input=file_path + "\n",
             text=True,
             capture_output=True
         )
@@ -366,96 +366,51 @@ async def analyze_audio(file: UploadFile = File(...)):
             flush=True
         )
 
-        print(
-            "M1 stdout:",
-            repr(m1_process.stdout),
-            flush=True
-        )
-
-        print(
-            "M1 stderr:",
-            repr(m1_process.stderr),
-            flush=True
-        )
-
+        print("M1 stdout:", repr(m1_process.stdout), flush=True)
+        print("M1 stderr:", repr(m1_process.stderr), flush=True)
 
         if m1_process.returncode != 0:
-
             return {
                 "error": "M1 analysis failed",
                 "details": m1_process.stderr,
                 "raw_output": m1_process.stdout
             }
 
-
-        # ----------------------------------------------------
-        # PARSE M1 RESULT
-        # ----------------------------------------------------
-
+        # Parse multiline JSON output from the LFCC M1 predictor.
         m1_output = m1_process.stdout.strip()
-
         m1_result = None
+        decoder = json.JSONDecoder()
 
-        for line in reversed(m1_output.splitlines()):
-
-            line = line.strip()
-
-            if (
-                line.startswith("{")
-                and
-                line.endswith("}")
-            ):
-
+        for i, char in enumerate(m1_output):
+            if char == "{":
                 try:
-
-                    m1_result = json.loads(line)
-                    break
-
-                except json.JSONDecodeError:
-                    pass
-
-                try:
-
-                    m1_result = ast.literal_eval(line)
-
-                    if isinstance(m1_result, dict):
+                    candidate, end = decoder.raw_decode(m1_output[i:])
+                    if isinstance(candidate, dict) and "fake_score" in candidate:
+                        m1_result = candidate
                         break
-
-                except Exception:
-                    pass
-
+                except json.JSONDecodeError:
+                    continue
 
         if m1_result is None:
-
             return {
                 "error": "M1 returned invalid result",
                 "raw_output": m1_output,
                 "stderr": m1_process.stderr
             }
 
-
-        m1_score = m1_result.get("score")
-
-        m1_label = m1_result.get(
-            "label",
-            "unknown"
-        )
-
+        # Map new output fields to the existing backend schema.
+        # fake_score represents the voice-fake probability from 0 to 1.
+        m1_score = m1_result.get("fake_score")
+        m1_label = m1_result.get("prediction", "unknown")
 
         if m1_score is None:
-
             return {
-                "error": "M1 returned no score",
+                "error": "M1 returned no fake_score",
                 "m1_result": m1_result
             }
 
-
         m1_score = float(m1_score)
-
-        m1_score = min(
-            max(m1_score, 0.0),
-            1.0
-        )
+        m1_score = min(max(m1_score, 0.0), 1.0)
 
 
         # ====================================================
@@ -574,10 +529,7 @@ async def analyze_audio(file: UploadFile = File(...)):
         # FINAL RESULT
         # ====================================================
 
-        processing_time = (
-            time.time()
-            - start_time
-        )
+        processing_time = time.time() - start_time
 
 
         result = {
